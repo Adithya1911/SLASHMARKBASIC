@@ -1,0 +1,438 @@
+from env import HighwayEnv, ACTION_NO_OP, get_highway_env
+import numpy as np 
+from typing import Tuple
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import random
+from collections import deque, namedtuple
+import os
+from PIL import Image
+
+Transition = namedtuple('Transition',('state', 'action', 'reward', 'next_state', 'done'))
+
+'''
+import _ Agent
+agent = Agent()
+env = Env()
+agent.train_policy(iterations = 1000)
+ 
+'''
+# Define a replay buffer for storing transitions
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        state = torch.FloatTensor(state)
+        action = torch.LongTensor([action])
+        reward = torch.FloatTensor([reward])
+        next_state = torch.FloatTensor(next_state)
+        done = torch.BoolTensor([done])
+        
+        self.buffer.append(Transition(state, action, reward, next_state, done))
+    
+    
+    def sample(self, batch_size):
+        Transitions = random.sample(self.buffer, batch_size)
+        batch = Transition(*zip(*Transitions))
+        state_batch = torch.stack(batch.state)
+        action_batch = torch.cat(batch.action)
+        reward_batch = torch.cat(batch.reward)
+        next_state_batch = torch.stack(batch.next_state)
+        done_batch = torch.cat(batch.done)
+        
+        return state_batch, action_batch, reward_batch, next_state_batch, done_batch
+    
+    def __len__(self):
+        return len(self.buffer)
+    
+
+
+# Define the DQN network
+
+class Q_network(nn.Module):
+    def __init__(self, state_size, action_size, hidden_size=32):
+        super(Q_network, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, action_size)
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+
+
+
+
+
+
+class DQNAgent:
+
+    def __init__(self, 
+                    env: HighwayEnv, 
+                    alpha: float = 0.1, 
+                    eps: float = 0.75, 
+                    discount_factor: float = 0.99,
+                    tau=0.005,
+                    iterations: int = 100000, 
+                    eps_type: str = 'constant',
+                    validation_runs: int = 100,
+                    validate_every: int = 1000,
+                    visualize_runs: int = 10, 
+                    visualize_every: int = 50000,
+                    log_folder:str = './',
+                    lr : float = 0.0001,
+                    batch_size: int = 256,
+                    hidden_size: int = 32,
+                    buffer_capacity: int = 10000,
+                    state_size: int = 6,
+                    action_size: int = 5,                                
+                    eps_start: float = 1.0,
+                    eps_end: float = 0.01,
+                    eps_decay: float = 0.995,
+                    
+                    
+                    ):
+
+        #TO DO: You can add you code here
+        self.env = env 
+       
+        self.eps = eps
+        self.df = discount_factor
+        self.alpha = alpha
+        self.iterations = iterations
+        self.validation_runs = validation_runs
+        self.validate_every = validate_every
+        self.visualization_runs = visualize_runs
+        self.visualization_every = visualize_every
+        self.log_folder = log_folder
+        self.eps_type = eps_type
+        self.tau = tau
+        self.batch_size = batch_size
+        self.replay_buffer = ReplayBuffer(10000)
+        self.policy_net = Q_network(state_size, action_size, hidden_size)
+        self.target_net = Q_network(state_size, action_size, hidden_size)
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.criterion = nn.MSELoss()
+        self.action_size = action_size
+        self.state_size = state_size 
+        self.buffer = ReplayBuffer(buffer_capacity)
+        self.eps = eps_start
+        self.eps_end = eps_end
+        self.eps_decay = eps_decay
+        self.losses:list[float] = []
+        self.avg_distances:list[float] = []
+        self.avg_rewards:list[float] = []
+        self.validation_points:list[float] = []
+        os.makedirs(log_folder, exist_ok=True)
+        self.c=0
+      
+        
+
+        
+        
+
+   
+
+
+    def choose_action(self, state, greedy = False):
+        '''
+        Right now returning random action but need to add
+        your own logic
+        '''
+        #TO DO: You can add you code here
+        if greedy or random.random() > self.eps:
+            # Choose a random action
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                q_values = self.policy_net(state_tensor)
+                return q_values.argmax().item()                
+        return np.random.randint(0, 5)
+
+
+    def update_target_network(self):
+        for target_param, policy_param in zip(self.target_net.parameters(), 
+                                            self.policy_net.parameters()):
+            target_param.data.copy_(
+                self.tau * policy_param.data + (1.0 - self.tau) * target_param.data)
+    
+
+
+    
+        
+    def train_step(self):
+        loss = self.compute_loss()
+        if loss is None:
+            return None
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        if self.c %100 ==0:
+            self.update_target_network()
+            self.c = 0
+        
+        self.eps = max(self.eps_end, self.eps * self.eps_decay)
+        
+        return loss.item()
+     
+    def compute_loss(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return None
+        
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        
+        # Compute current Q values
+        current_q = self.policy_net(states).gather(1, actions.unsqueeze(1))
+        
+        # Compute next Q values using target network
+        with torch.no_grad():
+            next_q = self.target_net(next_states).max(1)[0]
+            target_q = rewards + (1 - dones.float()) * self.df * next_q
+        
+        # Compute loss
+        loss = self.criterion(current_q.squeeze(), target_q)
+        return loss
+
+    def validate_policy(self) -> Tuple[float, float]:
+        '''
+        Returns:
+            tuple of (rewards, dist)
+                rewards: average across validation run 
+                        discounted returns obtained from first state
+                dist: average across validation run 
+                        distance covered by control car
+        '''
+        rewards = []
+        dist = []
+        
+
+        for i in range(self.validation_runs):
+            
+            obs = self.env.reset(i) #don't modify this
+            total_reward = 0
+            start_pos = self.env.control_car.pos
+            done = False
+            #TO DO: You can add you code here
+            while not done:
+                action = self.choose_action(obs, greedy=True)
+                obs, reward, done, _ = self.env.step(action)
+                total_reward += reward
+            dist.append(self.env.control_car.pos - start_pos)
+            rewards.append(total_reward)
+                      
+        return sum(rewards) / len(rewards), sum(dist) / len(dist)
+
+    def visualize_policy(self, i: int) -> None:
+        '''
+        Args:
+            i: total iterations done so for
+        
+        Create GIF visulizations of policy for visualization_runs
+        '''
+   
+        for j in range(self.visualization_runs):
+            obs = self.env.reset(j)  #don't modify this
+            done = False
+            images = [self.env.render()]
+            # images = [Image.fromarray(self.env.render())]
+
+            while not done:
+                action = self.choose_action(obs, greedy=True)
+                obs, _, done, _ = self.env.step(action)
+                images.append(self.env.render())
+            images = [Image.fromarray(img) for img in images]
+            gif_path = os.path.join(self.log_folder, f"trajectory_{i}_{j}.gif")
+            images[0].save(gif_path, save_all=True, append_images=images[1:], duration=200, loop=0)
+
+            print(f"Saved GIF path: {gif_path}")
+
+
+            #TO DO: You can add you code here
+
+    def visualize_lane_value(self, i: int) -> None:
+        '''
+        Args:
+            i: total iterations done so for
+        
+        Create image visualizations for no_op actions for particular lane
+        '''
+        for j in range(self.visualization_runs // 2):
+            self.env.reset(j)
+            done = False
+            k = 0
+            
+            while not done and k < 100:
+                k += 1
+                _, _, done, _ = self.env.step(ignore_control_car=True)
+                
+                if k % 20 == 0:
+                    qvalues = []
+                    states = self.env.get_all_lane_states()
+                    
+                    for state in states:
+                        if len(state) != self.state_size:
+                            # Pad state with zeros if it's smaller than expected
+                            state = np.pad(state, (0, max(0, self.state_size - len(state))))
+                        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                        with torch.no_grad():
+                            # Get all Q-values for this state
+                            all_q_values = self.policy_net(state_tensor).squeeze(0)
+                            # Make sure ACTION_NO_OP is within bounds
+                            action_no_op = min(ACTION_NO_OP, self.action_size - 1)
+                            q_value = all_q_values[action_no_op]
+                        qvalues.append(q_value.item())
+                    
+                    img = self.env.render_lane_state_values(qvalues)
+                    if img is not None:
+                        plt.figure(figsize=(10, 5))
+                        plt.imshow(img)
+                        plt.axis('off')
+                        plt.savefig(
+                            os.path.join(self.log_folder, f'lane_values_{i}_step_{k}.png'),
+                            bbox_inches='tight', 
+                            pad_inches=0
+                        )
+                        plt.close()
+
+    def visualize_speed_value(self, i: int) -> None:
+        '''
+        Args:
+            i: total iterations done so for
+        
+        Create image visualizations for no_op actions for particular speed
+        '''
+        for j in range(self.visualization_runs // 2):
+            self.env.reset(j)
+            done = False
+            k = 0
+            
+            while not done and k < 100:
+                k += 1
+                _, _, done, _ = self.env.step(ignore_control_car=True)
+                
+                if k % 20 == 0:
+                    qvalues = []
+                    states = self.env.get_all_speed_states()
+                    
+                    for state in states:
+                        if len(state) != self.state_size:
+                            # Pad state with zeros if it's smaller than expected
+                            state = np.pad(state, (0, max(0, self.state_size - len(state))))
+                        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                        with torch.no_grad():
+                            # Get all Q-values for this state
+                            all_q_values = self.policy_net(state_tensor).squeeze(0)
+                            # Make sure ACTION_NO_OP is within bounds
+                            action_no_op = min(ACTION_NO_OP, self.action_size - 1)
+                            q_value = all_q_values[action_no_op]
+                        qvalues.append(q_value.item())
+                    
+                    img = self.env.render_speed_state_values(qvalues)
+                    if img is not None:
+                        plt.figure(figsize=(10, 5))
+                        plt.imshow(img)
+                        plt.axis('off')
+                        plt.savefig(
+                            os.path.join(self.log_folder, f'speed_values_{i}_step_{k}.png'),
+                            bbox_inches='tight',
+                            pad_inches=0
+                        )
+                        plt.close()
+    def get_policy(self):
+        '''
+        Learns the policy
+        '''
+        #TO DO: You can add you code here
+        for iteration in tqdm(range(1, self.iterations + 1), desc="Training Progress"):
+        # for iteration in range(1, self.iterations + 1):
+            # print(f"Iteration: {iteration}")
+            # Run one episode
+            state = self.env.reset()
+            done = False
+            self.c+=1
+            j=0
+            while not done:
+                j+=1
+                action = self.choose_action(state)
+                next_state, reward, done, _ = self.env.step(action)
+                self.replay_buffer.push(state, action, reward, next_state, done)
+                state = next_state
+                
+            # Train on batch
+                if j>100:
+                    loss = self.train_step()
+                    j=0
+                    if loss is not None:
+                        self.losses.append(loss)
+                
+            # Validation and logging
+            if iteration % self.validate_every == 0:
+                avg_reward, avg_distance = self.validate_policy()
+                self.avg_rewards.append(avg_reward)
+                self.avg_distances.append(avg_distance)
+                # self.validation_points.append(iteration)
+                
+                print(f"Iteration: {iteration}, Epsilon: {self.eps:.3f}, "
+                      f"Avg Reward: {avg_reward:.2f}, Avg Distance: {avg_distance:.2f}")
+            if iteration % self.visualization_every == 0:
+                
+                self.visualize_policy(iteration)
+                self.visualize_lane_value(iteration)
+                self.visualize_speed_value(iteration)
+            loss = self.train_step()
+            if loss is not None:
+                self.losses.append(loss)
+        print(self.validate_every)
+        
+        # Plotting average rewards and average distance returned from validation
+        plt.figure(figsize=(12,6))
+        plt.subplot(1,2,1)
+        plt.plot(np.arange(0, self.iterations, self.validate_every), self.avg_rewards, label="Average Rewards", color='green')
+        plt.xlabel("Iterations with 1000 step size")
+        plt.ylabel("Average rewards with respect to learned Q_table")
+        plt.title("Average rewards plot over 1000 iterations")
+        plt.legend()
+        plt.grid()
+
+        plt.subplot(1,2,2)
+        plt.plot(np.arange(0,self.iterations, self.validate_every),self.avg_distances , label="Average Distance", color='orange')
+        plt.xlabel("Iterations with 1000 step size")
+        plt.ylabel("Average distance with respect to learned Q_table")
+        plt.title("Average distance plot over 1000 iterations")
+        plt.legend()
+        plt.grid()
+
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == '__main__':
+
+    
+    parser = argparse.ArgumentParser(description="Parse command-line arguments.")
+    parser.add_argument("--iterations", type=int, required=True, help="Number of iterations (integer).")
+    parser.add_argument("--output_folder", type=str, required=True, help="Path to the input file.")
+    args = parser.parse_args()
+    #for part a
+    # env = get_highway_env(dist_obs_states = 5, reward_type = 'dist')
+    # '''
+    # For part b:
+    env = get_highway_env(dist_obs_states = 5, reward_type = 'dist', obs_type='continious')
+    # '''
+    env = HighwayEnv()
+    state=env.reset()
+    
+    qagent = DQNAgent(env,
+                      iterations = args.iterations,
+                      log_folder = args.output_folder)
+    
+    qagent.get_policy()
