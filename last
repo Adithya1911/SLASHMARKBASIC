@@ -1,0 +1,281 @@
+from env import HighwayEnv, ACTION_NO_OP, get_highway_env
+import numpy as np
+import random
+from collections import deque, namedtuple
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import time
+from PIL import Image
+import os
+from typing import Tuple
+import math
+
+# Define a Transition Tuple
+Transition = namedtuple('Transition', 
+                       ('state', 'action', 'reward', 'next_state', 'done'))
+
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.beta_start = beta_start
+        self.beta_frames = beta_frames
+        self.frame = 1
+        
+        self.buffer = []
+        self.pos = 0
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+    
+    def push(self, state, action, reward, next_state, done):
+        max_priority = self.priorities.max() if self.buffer else 1.0
+        
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(Transition(state, action, reward, next_state, done))
+        else:
+            self.buffer[self.pos] = Transition(state, action, reward, next_state, done))
+        
+        self.priorities[self.pos] = max_priority
+        self.pos = (self.pos + 1) % self.capacity
+    
+    def sample(self, batch_size):
+        if len(self.buffer) < batch_size:
+            return None
+            
+        priorities = self.priorities[:len(self.buffer)]
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
+        
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+        
+        # Importance sampling weights
+        beta = min(1.0, self.beta_start + (1.0 - self.beta_start) * (self.frame / self.beta_frames))
+        self.frame += 1
+        
+        weights = (len(self.buffer) * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        weights = np.array(weights, dtype=np.float32)
+        
+        batch = Transition(*zip(*samples))
+        return batch.state, batch.action, batch.reward, batch.next_state, batch.done, indices, weights
+    
+    def update_priorities(self, indices, priorities):
+        for idx, priority in zip(indices, priorities):
+            self.priorities[idx] = priority
+    
+    def __len__(self):
+        return len(self.buffer)
+
+class DQN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_size)
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+class BestAgent:
+    def __init__(self, iterations=20000):
+        self.env = get_highway_env(reward_type='hybrid')  # Use hybrid rewards
+        self.state_size = len(self.env.get_obs())
+        self.action_size = 5
+        
+        # Hyperparameters
+        self.batch_size = 128
+        self.gamma = 0.99
+        self.epsilon_start = 1.0
+        self.epsilon_end = 0.01
+        self.epsilon_decay = 0.9995
+        self.train_every = 4
+        self.update_target_every = 1000
+        self.learning_rate = 0.00025
+        self.tau = 0.005  # For soft target updates
+        
+        # Memory
+        self.memory = PrioritizedReplayBuffer(100000)
+        
+        # Networks
+        self.policy_net = DQN(self.state_size, self.action_size)
+        self.target_net = DQN(self.state_size, self.action_size)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        
+        # Optimizer
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
+        
+        # Tracking
+        self.iterations = iterations
+        self.steps = 0
+        self.epsilon = self.epsilon_start
+        self.max_training_time = 110 * 60  # 110 minutes
+        
+        # Visualization
+        self.validate_every = 1000
+        self.visualization_every = 5000
+        self.visualization_runs = 5
+        self.log_folder = './logs'
+        os.makedirs(self.log_folder, exist_ok=True)
+        
+        # Metrics
+        self.avg_rewards = []
+        self.avg_distances = []
+        self.losses = []
+
+    def choose_action(self, state, greedy=False):
+        if not greedy and random.random() < self.epsilon:
+            return random.randrange(self.action_size)
+        
+        state = torch.FloatTensor(state).unsqueeze(0)
+        with torch.no_grad():
+            q_values = self.policy_net(state)
+        return torch.argmax(q_values).item()
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.push(state, action, reward, next_state, done)
+
+    def update_target_network(self):
+        # Soft update
+        for target_param, policy_param in zip(self.target_net.parameters(), 
+                                           self.policy_net.parameters()):
+            target_param.data.copy_(
+                self.tau * policy_param.data + (1.0 - self.tau) * target_param.data)
+
+    def compute_td_loss(self, batch_size):
+        sample = self.memory.sample(batch_size)
+        if sample is None:
+            return None
+            
+        states, actions, rewards, next_states, dones, indices, weights = sample
+        
+        # Convert to tensors
+        states = torch.FloatTensor(np.array(states))
+        actions = torch.LongTensor(np.array(actions))
+        rewards = torch.FloatTensor(np.array(rewards))
+        next_states = torch.FloatTensor(np.array(next_states))
+        dones = torch.FloatTensor(np.array(dones))
+        weights = torch.FloatTensor(weights)
+        
+        # Current Q values
+        current_q = self.policy_net(states).gather(1, actions.unsqueeze(1))
+        
+        # Target Q values
+        with torch.no_grad():
+            next_q = self.target_net(next_states).max(1)[0]
+            target = rewards + (1 - dones) * self.gamma * next_q
+        
+        # Update priorities
+        td_errors = (target - current_q.squeeze()).abs().detach().numpy()
+        self.memory.update_priorities(indices, td_errors + 1e-5)
+        
+        # Compute weighted loss
+        loss = (weights * (current_q.squeeze() - target) ** 2).mean()
+        return loss
+
+    def validate_policy(self) -> Tuple[float, float]:
+        rewards = []
+        distances = []
+        
+        for _ in range(10):  # Reduced from 1000 to 10 for efficiency
+            state = self.env.reset()
+            total_reward = 0
+            start_pos = self.env.control_car.pos
+            done = False
+            
+            while not done:
+                action = self.choose_action(state, greedy=True)
+                state, reward, done, _ = self.env.step(action)
+                total_reward += reward
+            
+            distances.append(self.env.control_car.pos - start_pos)
+            rewards.append(total_reward)
+                      
+        return np.mean(rewards), np.mean(distances)
+
+    def get_policy(self):
+        start_time = time.time()
+        
+        for iteration in range(1, self.iterations + 1):
+            # Check time limit
+            if time.time() - start_time > self.max_training_time:
+                print("Training time limit reached")
+                break
+                
+            # Generate episode
+            state = self.env.reset()
+            done = False
+            
+            while not done:
+                # Select action
+                action = self.choose_action(state)
+                
+                # Take step
+                next_state, reward, done, _ = self.env.step(action)
+                
+                # Store experience
+                self.remember(state, action, reward, next_state, done)
+                state = next_state
+                
+                # Train periodically
+                if self.steps % self.train_every == 0 and len(self.memory) >= self.batch_size:
+                    loss = self.compute_td_loss(self.batch_size)
+                    if loss is not None:
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                        self.optimizer.step()
+                        self.losses.append(loss.item())
+                
+                self.steps += 1
+            
+            # Decay epsilon
+            self.epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
+                         math.exp(-1. * self.steps / (self.iterations * 0.1))
+            
+            # Update target network
+            if iteration % self.update_target_every == 0:
+                self.update_target_network()
+            
+            # Validation and visualization
+            if iteration % self.validate_every == 0:
+                avg_reward, avg_distance = self.validate_policy()
+                self.avg_rewards.append(avg_reward)
+                self.avg_distances.append(avg_distance)
+                print(f"Iteration: {iteration}, Avg Reward: {avg_reward:.2f}, Avg Distance: {avg_distance:.2f}, Epsilon: {self.epsilon:.3f}")
+        
+        # Save final metrics
+        self.plot_training_progress()
+
+    def plot_training_progress(self):
+        plt.figure(figsize=(15, 5))
+        
+        # Rewards
+        plt.subplot(1, 3, 1)
+        plt.plot(self.avg_rewards)
+        plt.title("Average Reward per Validation")
+        plt.xlabel("Validation Episode")
+        plt.ylabel("Average Reward")
+        
+        # Distances
+        plt.subplot(1, 3, 2)
+        plt.plot(self.avg_distances)
+        plt.title("Average Distance per Validation")
+        plt.xlabel("Validation Episode")
+        plt.ylabel("Average Distance")
+        
+        # Losses
+        plt.subplot(1, 3, 3)
+        plt.plot(self.losses)
+        plt.title("Training Loss")
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.log_folder, "training_progress.png"))
+        plt.close()
