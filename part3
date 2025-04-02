@@ -1,0 +1,227 @@
+
+from env import HighwayEnv, ACTION_NO_OP, get_highway_env
+import numpy as np
+import random
+from collections import deque, namedtuple
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+
+# Define a transition tuple
+Transition = namedtuple('Transition', 
+                       ('state', 'action', 'reward', 'next_state', 'done', 'priority'))
+
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
+        self.capacity = capacity
+        self.alpha = alpha  # determines how much prioritization is used
+        self.beta_start = beta_start
+        self.beta_frames = beta_frames
+        self.frame = 1  # for beta calculation
+        
+        self.buffer = []
+        self.pos = 0
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+    
+    def push(self, state, action, reward, next_state, done):
+        max_priority = self.priorities.max() if self.buffer else 1.0
+        
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(Transition(state, action, reward, next_state, done, max_priority))
+        else:
+            self.buffer[self.pos] = Transition(state, action, reward, next_state, done, max_priority)
+        
+        self.priorities[self.pos] = max_priority
+        self.pos = (self.pos + 1) % self.capacity
+    
+    def sample(self, batch_size):
+        if len(self.buffer) == 0:
+            return [], [], [], [], [], []
+            
+        priorities = self.priorities[:len(self.buffer)]
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
+        
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+        
+        # Compute importance sampling weights
+        beta = min(1.0, self.beta_start + (1.0 - self.beta_start) * (self.frame / self.beta_frames))
+        self.frame += 1
+        
+        weights = (len(self.buffer) * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        weights = np.array(weights, dtype=np.float32)
+        
+        batch = Transition(*zip(*samples))
+        return batch.state, batch.action, batch.reward, batch.next_state, batch.done, indices, weights
+    
+    def update_priorities(self, indices, priorities):
+        for idx, priority in zip(indices, priorities):
+            self.priorities[idx] = priority
+    
+    def __len__(self):
+        return len(self.buffer)
+
+class DQN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(state_size, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.fc3 = nn.Linear(32, action_size)
+        self.relu = nn.ReLU()
+        
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        return self.fc3(x)
+
+class BestAgent:
+    def __init__(self, iterations=20000) -> None:
+        self.env = get_highway_env(reward_type='hybrid')
+        self.state_size = len(self.env.get_obs())
+        self.action_size = 5
+        self.rewards=[]
+        self.distances=[]
+        
+        # Hyperparameters
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.0001
+        self.epsilon_decay = 0.9995
+        self.batch_size = 64
+        self.update_target_every = 100
+        
+        # Networks
+        self.model = DQN(self.state_size, self.action_size)
+        self.target_model = DQN(self.state_size, self.action_size)
+        self.target_model.load_state_dict(self.model.state_dict())
+        
+        # Optimizer and loss
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.MSELoss()
+        
+        # Prioritized replay buffer
+        self.memory = PrioritizedReplayBuffer(100000)
+        
+        self.iterations = iterations
+        self.steps = 0
+    
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.push(state, action, reward, next_state, done)
+    
+    def choose_action(self, state, type='random'):
+        if type=='random': return torch.randint(0, self.action_size, (1,)).item()
+        else:
+            if np.random.rand() <= self.epsilon:
+                return random.randrange(self.action_size)
+            state = torch.FloatTensor(state)
+            with torch.no_grad():
+                q_values = self.model(state)
+            return torch.argmax(q_values).item()
+    
+    def update_target_network(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+    
+    def compute_td_loss(self, batch_size):
+        if len(self.memory) < batch_size:
+            return None
+            
+        # Sample from prioritized replay buffer
+        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(batch_size)
+        
+        # Convert to tensors
+        states = torch.FloatTensor(np.array(states))
+        actions = torch.LongTensor(np.array(actions))
+        rewards = torch.FloatTensor(np.array(rewards))
+        next_states = torch.FloatTensor(np.array(next_states))
+        dones = torch.FloatTensor(np.array(dones))
+        weights = torch.FloatTensor(weights)
+        
+        # Current Q values
+        current_q = self.model(states).gather(1, actions.unsqueeze(1))
+        
+        # Target Q values
+        with torch.no_grad():
+            next_q = self.target_model(next_states).max(1)[0]
+            target = rewards + (1 - dones) * self.gamma * next_q
+        
+        # Compute TD errors and update priorities
+        td_errors = (target - current_q.squeeze()).abs().detach().numpy()
+        self.memory.update_priorities(indices, td_errors + 1e-5)  # small constant to avoid zero priority
+        
+        # Compute weighted loss
+        loss = (weights * (current_q.squeeze() - target) ** 2).mean()
+        
+        return loss
+    
+    def get_policy(self) -> None:
+        best_reward = -float('inf')
+        
+        for iteration in range(1, self.iterations + 1):
+            state = self.env.reset()
+            total_reward = 0
+            done = False
+            start_pos = self.env.control_car.pos
+            self.steps += 1
+            j=0
+            while not done:
+                j+=1
+                action = self.choose_action(state)
+                next_state, reward, done, _ = self.env.step(action)
+                
+                # Store transition in prioritized replay buffer
+                self.remember(state, action, reward, next_state, done)
+                
+                state = next_state
+                total_reward += reward
+
+                # if j>1000:
+                #     j=0
+                #     loss = self.compute_td_loss(self.batch_size)
+                #     if loss is not None:
+                #         self.optimizer.zero_grad()
+                #         loss.backward()
+                #         self.optimizer.step()
+                        
+                #         # Decay epsilon
+                #         if self.epsilon > self.epsilon_min:
+                #             self.epsilon *= self.epsilon_decay
+
+                
+                
+                # Train on batch
+            loss = self.compute_td_loss(self.batch_size)
+            if loss is not None:
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                
+                # Decay epsilon
+                if self.epsilon > self.epsilon_min:
+                    self.epsilon *= self.epsilon_decay
+            
+            # Update target network periodically
+            if self.steps % self.update_target_every == 0:
+                self.update_target_network()
+            distance = self.env.control_car.pos-start_pos
+
+            
+            # Print progress
+            self.rewards.append(total_reward)
+            self.distances.append(distance)
+
+            if iteration % 1000 == 0:
+                avg_reward = np.mean(self.rewards[-1000:]) if iteration >= 1000 else np.mean(self.rewards)
+                avg_distance = np.mean(self.distances[-1000:]) if iteration >= 1000 else np.mean(self.distances)
+                print(f'Iteration: {iteration}/{self.iterations}, Reward: {total_reward:.2f}, '
+                      f'Avg_Reward: {avg_reward:.2f}, Avg_Distance: {avg_distance:.2f}, '
+                      f'Epsilon: {self.epsilon:.3f}')
+            
+        with open('outputs.txt', 'w') as f:
+            f.write("Iteration Reward Distance\n")  # Header
+            f.write("-------------------------\n")
+            
+            for i in range(len(self.rewards)):
+                f.write(f"{i+1}\t{self.rewards[i]}\t{self.distances[i]}\n")
